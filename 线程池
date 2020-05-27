@@ -1,0 +1,476 @@
+1:线程池的优点
+	1:线程是稀缺资源,很重,使用线程池可以减少创建和销毁线程的次数,每个工作线程都可以重复使用,节约了系统资源.
+	2:可以根据系统的承受能力,调整线程池的工作线程的数量,防止因为内存消耗过多导致服务器崩溃.
+
+2:线程池的参数:
+public ThreadPoolExecutor(int corePoolSize,
+                               int maximumPoolSize,
+                               long keepAliveTime,
+                               TimeUnit unit,
+                               BlockingQueue<Runnable> workQueue,
+                               RejectedExecutionHandler handler) 
+corePoolSize：线程池核心线程数量
+maximumPoolSize:线程池最大线程数量
+keepAliverTime：当活跃线程数大于核心线程数时，空闲的多余线程最大存活时间
+unit：存活时间的单位(注意,这是指空闲线程在不用工作时的最大存活时间,因为线程池只能管理空闲中的线程,无法管理工作中的线程,这也是面试官提醒我的)
+workQueue：存放任务的队列
+handler：超出线程范围和队列容量的任务的处理程序,即拒绝策略
+
+3:线程池的实现原理
+提交一个任务到线程池中，线程池的处理流程如下：
+1、判断线程池里的核心线程是否都在执行任务，如果不是（核心线程空闲或者还有核心线程没有被创建）则创建一个新的工作线程来执行任务。如果核心线程都在执行任务，则进入下个流程。
+2、线程池判断工作队列是否已满，如果工作队列没有满，则将新提交的任务存储在这个工作队列里。如果工作队列满了，则进入下个流程。
+3、判断线程池里的线程是否都处于工作状态，如果没有，则创建一个新的工作线程来执行任务。如果已经满了，则交给饱和策略来处理这个任务。
+
+4:线程池的源码解读
+1.ThreadPoolExecutor的execute()方法
+public void execute(Runnable command) {
+        if (command == null)
+            throw new NullPointerException();　　　　　　 
+	//如果线程数大于等于基本线程数或者线程创建失败，将任务加入队列
+        if (poolSize >= corePoolSize || !addIfUnderCorePoolSize(command)) {　　　　　　　　　　
+	    //线程池处于运行状态并且加入等待队列成功
+            if (runState == RUNNING && workQueue.offer(command)) {
+                if (runState != RUNNING || poolSize == 0)
+                    ensureQueuedTaskHandled(command);
+            }　　　　　　　　　
+	    //线程池不处于运行状态或者加入队列失败，则创建线程（创建的是非核心线程）
+            else if (!addIfUnderMaximumPoolSize(command))　　　　　　　　　　　
+		//创建线程失败，则采取阻塞处理的方式
+                reject(command); // is shutdown or saturated
+        }
+    }
+	...
+}
+//以上步骤,基本上是按照线程池的实现原理来的
+
+2.创建线程的方法：addIfUnderCorePoolSize(command)
+private boolean addIfUnderCorePoolSize(Runnable firstTask) {
+        Thread t = null;
+        final ReentrantLock mainLock = this.mainLock;
+	//通过枷加jdk层面的锁来保证数据的一致性,即保证并发情况下,线程池中的线程数被拿取和释放是一致的.
+        mainLock.lock();
+        try {
+	    //当线程池中还有核心线程,那么可以创建一个新的线程去处理这个任务
+            if (poolSize < corePoolSize && runState == RUNNING)
+                t = addThread(firstTask);
+        } finally {
+            mainLock.unlock();
+	    //reentrantLock在finally中释放锁,是为了确保锁一定会被释放,不然可能会因为异常导致锁被办法被释放等异常情况
+        }
+        if (t == null)
+            return false;
+        t.start();//如果创建成功就让它跑起来
+        return true;
+    }
+	...
+}
+
+3.addThread的方法
+private Thread addThread(Runnable firstTask) {
+	//这里将任务封装到worker中,并通过线程个工厂创建出一个新的线程?
+        Worker w = new Worker(firstTask);
+        Thread t = threadFactory.newThread(w);
+        if (t != null) {//如果能够成功创建成功,就把该worker加入工作线程组
+            w.thread = t;
+            workers.add(w);
+            int nt = ++poolSize;//创建了的线程数量加一
+            if (nt > largestPoolSize)
+                largestPoolSize = nt;
+        }
+        return t;
+    }
+	...
+}
+
+
+4:worker类里的方法run:
+public void run() {
+            try {
+                Runnable task = firstTask;
+                firstTask = null;
+		//当前任务不为null,或者任然可以取到任务   就是循环去取工作队列里的任务来执行
+                while (task != null || (task = getTask()) != null) {
+                    runTask(task);
+                    task = null;
+                }
+            } finally {
+                workerDone(this);
+            }
+        }
+	...
+}
+
+
+5.测试观察线程池的工作原理:
+1:创建一个线程:
+public class ThreadPoolTest implements Runnable
+{
+    @Override
+    public void run()
+    {
+        try
+        {
+            Thread.sleep(300);
+        }
+        catch (InterruptedException e)
+        {
+            e.printStackTrace();
+        }
+    }
+}
+
+2:线程池中循环运行16个线程;
+public static void main(String[] args)
+    {
+        LinkedBlockingQueue<Runnable> queue =
+            new LinkedBlockingQueue<Runnable>(5);
+        ThreadPoolExecutor threadPool = new ThreadPoolExecutor(5, 10, 60, TimeUnit.SECONDS, queue);
+        for (int i = 0; i < 16 ; i++)
+        {
+            threadPool.execute(
+                new Thread(new ThreadPoolTest(), "Thread".concat(i + "")));
+            System.out.println("线程池中活跃的线程数： " + threadPool.getPoolSize());
+            if (queue.size() > 0)
+            {
+                System.out.println("----------------队列中阻塞的线程数" + queue.size());
+            }
+        }
+        threadPool.shutdown();
+    }
+
+3:执行结果:
+线程池中活跃的线程数： 1
+线程池中活跃的线程数： 2
+线程池中活跃的线程数： 3
+线程池中活跃的线程数： 4
+线程池中活跃的线程数： 5
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数1
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数2
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数3
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数4
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数5
+线程池中活跃的线程数： 6
+----------------队列中阻塞的线程数5
+线程池中活跃的线程数： 7
+----------------队列中阻塞的线程数5
+线程池中活跃的线程数： 8
+----------------队列中阻塞的线程数5
+线程池中活跃的线程数： 9
+----------------队列中阻塞的线程数5
+线程池中活跃的线程数： 10
+----------------队列中阻塞的线程数5
+Exception in thread "main" java.util.concurrent.RejectedExecutionException: Task Thread[Thread15,5,main] rejected from java.util.concurrent.ThreadPoolExecutor@232204a1[Running, pool size = 10, active threads = 10, queued tasks = 5, completed tasks = 0]
+    at java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2047)
+    at java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:823)
+    at java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1369)
+    at test.ThreadTest.main(ThreadTest.java:17)
+这里抛的异常是我的拒绝策略导致的.默认的拒绝策略AbortPolicy:直接抛出异常。
+
+
+从结果可以观察出：
+1、创建的线程池具体配置为：核心线程数量为5个；全部线程数量为10个；工作队列的长度为5。
+2、我们通过queue.size()的方法来获取工作队列中的任务数。
+3、运行原理：
+      刚开始都是在创建新的线程，达到核心线程数量5个后，新的任务进来后不再创建新的线程，而是将任务加入工作队列，任务队列到达上线5个后，新的任务又会创建新的普通线程，直到达到线程池最大的线程数量10个，后面的任务则根据配置的饱和策略来处理。我们这里没有具体配置，使用的是默认的配置AbortPolicy:直接抛出异常。
+　　当然，为了达到我需要的效果，上述线程处理的任务都是利用休眠导致线程没有释放！！！
+
+6:RejectedExecutionHandler：饱和策略
+当队列和线程池都满了，说明线程池处于饱和状态，那么必须对新提交的任务采用一种特殊的策略来进行处理。这个策略默认配置是AbortPolicy，表示无法处理新的任务而抛出异常。JAVA提供了4中策略：
+1、AbortPolicy：直接抛出异常
+2、CallerRunsPolicy：只用调用所在的线程运行任务
+3、DiscardOldestPolicy：丢弃队列里最近的一个任务，并执行当前任务。
+4、DiscardPolicy：不处理，丢弃掉。
+现在用第四种策略来处理上面的程序：
+
+1.public static void main(String[] args)
+    {
+        LinkedBlockingQueue<Runnable> queue =
+            new LinkedBlockingQueue<Runnable>(3);
+        RejectedExecutionHandler handler = new ThreadPoolExecutor.DiscardPolicy();
+
+        ThreadPoolExecutor threadPool = new ThreadPoolExecutor(2, 5, 60, TimeUnit.SECONDS, queue,handler);
+        for (int i = 0; i < 9 ; i++)
+        {
+            threadPool.execute(
+                new Thread(new ThreadPoolTest(), "Thread".concat(i + "")));
+            System.out.println("线程池中活跃的线程数： " + threadPool.getPoolSize());
+            if (queue.size() > 0)
+            {
+                System.out.println("----------------队列中阻塞的线程数" + queue.size());
+            }
+        }
+        threadPool.shutdown();
+    }
+执行结果:
+线程池中活跃的线程数： 1
+线程池中活跃的线程数： 2
+线程池中活跃的线程数： 2
+----------------队列中阻塞的线程数1
+线程池中活跃的线程数： 2
+----------------队列中阻塞的线程数2
+线程池中活跃的线程数： 2
+----------------队列中阻塞的线程数3
+线程池中活跃的线程数： 3
+----------------队列中阻塞的线程数3
+线程池中活跃的线程数： 4
+----------------队列中阻塞的线程数3
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数3
+线程池中活跃的线程数： 5
+----------------队列中阻塞的线程数3
+
+2.这里采用了丢弃策略后，就没有再抛出异常，而是直接丢弃。在某些重要的场景下，可以采用记录日志或者存储到数据库中，而不应该直接丢弃。
+
+
+
+
+
+Java线程池原理学习二:
+Executor框架的两级调度模型
+在HotSpot VM的模型中，Java线程与本地操作系统线程是一一对应的.Java线程启动时会创建一个本地操作系统线程,Java线程终止时,对应的本地操作系统也会被销毁回收.
+重点:在上层,Java程序会将应用分解为多个任务,然后使用应用级的调度器(Executor)将这些任务映射成固定数量的线程;又因为Java线程与本地线程一一对应,在底层,操作系统会调度所有线程并将他们分配给可用CPU执行.
+Executor矿建类图:以后补上
+
+
+
+在前面介绍的JAVA线程既是工作单元，也是执行机制。而在Executor框架中，我们将工作单元与执行机制分离开来。Runnable和Callable是工作单元（也就是俗称的任务），而执行机制由Executor来提供。这样一来Executor是基于生产者消费者模式的，提交任务的操作相当于生成者，执行任务的线程相当于消费者。
+
+1、从类图上看，Executor接口是异步任务执行框架的基础，该框架能够支持多种不同类型的任务执行策略。
+public interface Executor {
+
+    void execute(Runnable command);
+}
+Executor接口就提供了一个执行方法，任务是Runnbale类型，不支持Callable类型。
+2、ExecutorService接口实现了Executor接口，主要提供了关闭线程池和submit方法：
+public interface ExecutorService extends Executor {
+    List<Runnable> shutdownNow();
+    boolean isTerminated();
+    <T> Future<T> submit(Callable<T> task);
+ }
+
+
+另外该接口有两个重要的实现类：ThreadPoolExecutor与ScheduledThreadPoolExecutor。
+
+其中ThreadPoolExecutor是线程池的核心实现类，用来执行被提交的任务；//这是重点,ThreadPoolExecutor主要是来执行任务的
+而ScheduledThreadPoolExecutor是一个实现类，可以在给定的延迟后运行任务，或者定期执行命令。
+
+在之前;我是使用ThreadPoolExecutor来通过给定不同的参数从而创建自己所需的线程池，但是在后面的工作中不建议这种方式，推荐使用Exectuors工厂方法来创建线程池
+这里先来区别线程池和线程组（ThreadGroup与ThreadPoolExecutor）这两个概念：
+a、线程组就表示一个线程的集合。  //表示一组线程
+b、线程池是为线程的生命周期开销问题和资源不足问题提供解决方案，主要是用来管理线程。 //线程池,用来管理线程
+
+Executors可以创建3种类型的ThreadPoolExecutor：SingleThreadExecutor、FixedThreadExecutor和CachedThreadPool
+a、SingleThreadExecutor：单线程线程池
+单线程池的源码;
+ExecutorService threadPool = Executors.newSingleThreadExecutor();
+public static ExecutorService newSingleThreadExecutor() {
+        return new FinalizableDelegatedExecutorService
+            (new ThreadPoolExecutor(1, 1,
+                                    0L, TimeUnit.MILLISECONDS,
+                                    new LinkedBlockingQueue<Runnable>()));
+    }
+我们从源码来看可以知道，单线程线程池的创建也是通过ThreadPoolExecutor，里面的核心线程数和线程数都是1，并且工作队列使用的是无界队列。由于是单线程工作，每次只能处理一个任务，所以后面所有的任务都被阻塞在工作队列中，只能一个个任务执行。
+
+b、FixedThreadExecutor：固定大小线程池
+ExecutorService threadPool = Executors.newFixedThreadPool(5);
+public static ExecutorService newFixedThreadPool(int nThreads) {
+        return new ThreadPoolExecutor(nThreads, nThreads,
+                                      0L, TimeUnit.MILLISECONDS,
+                                      new LinkedBlockingQueue<Runnable>());
+    }
+这个与单线程类似，只是创建了固定大小的线程数量。
+
+c、CachedThreadPool:无界线程池
+ExecutorService threadPool = Executors.newCachedThreadPool();
+public static ExecutorService newCachedThreadPool() {
+        return new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                                      60L, TimeUnit.SECONDS,
+                                      new SynchronousQueue<Runnable>());
+    }
+无界线程池意味着没有工作队列，任务进来就执行，线程数量不够就创建，与前面两个的区别是：空闲的线程会被回收掉，空闲的时间是60s。这个适用于执行很多短期异步的小程序或者负载较轻的服务器。
+
+
+Callable、Future、FutureTasK详解
+Callable与Future是在JAVA的后续版本中引入进来的，Callable类似于Runnable接口，实现Callable接口的类与实现Runnable的类都是可以被线程执行的任务。
+
+三者之间的关系：     重点:这三个的组合可以构成一个异步的效果从而提供运行,计算的效率
+Callable是Runnable封装的异步运算任务。
+Future用来保存Callable异步运算的结果
+FutureTask封装Future的实体类
+1、Callable与Runnbale的区别
+a、Callable定义的方法是call，而Runnable定义的方法是run。
+b、call方法有返回值，而run方法是没有返回值的。
+c、call方法可以抛出异常，而run方法不能抛出异常。
+2、Future
+Future表示异步计算的结果，提供了以下方法，主要是判断任务是否完成、中断任务、获取任务执行结果
+public interface Future<V> {
+    boolean cancel(boolean mayInterruptIfRunning);
+    boolean isCancelled();
+    boolean isDone();
+    V get() throws InterruptedException, ExecutionException;
+    V get(long timeout, TimeUnit unit)
+        throws InterruptedException, ExecutionException, TimeoutException;
+}
+
+
+3、FutureTask<V>
+
+可取消的异步计算，此类提供了对Future的基本实现，仅在计算完成时才能获取结果，如果计算尚未完成，则阻塞get方法。
+
+public class FutureTask<V> implements RunnableFuture<V>
+public interface RunnableFuture<V> extends Runnable, Future<V>
+
+这句话是很有意思的.
+FutureTask不仅实现了Future接口，还实现了Runnable接口，所以不仅可以将FutureTask当成一个任务交给Executor来执行，还可以通过Thread来创建一个线程。
+
+Callable与FutureTask
+定义一个callable的任务：
+public class MyCallableTask implements Callable<Integer>
+{
+    @Override
+    public Integer call()
+        throws Exception
+    {
+        System.out.println("callable do somothing");
+        Thread.sleep(5000);
+        return new Random().nextInt(100);
+    }
+}
+
+public class CallableTest
+{
+    public static void main(String[] args) throws Exception
+    {
+        Callable<Integer> callable = new MyCallableTask();
+        FutureTask<Integer> future = new FutureTask<Integer>(callable);
+        Thread thread = new Thread(future);
+        thread.start();
+        Thread.sleep(100);
+        //尝试取消对此任务的执行
+        future.cancel(true);
+        //判断是否在任务正常完成前取消
+        System.out.println("future is cancel:" + future.isCancelled());
+        if(!future.isCancelled())
+        {
+            System.out.println("future is cancelled");
+        }
+        //判断任务是否已完成
+        System.out.println("future is done:" + future.isDone());
+        if(!future.isDone())
+        {
+            System.out.println("future get=" + future.get());
+        }
+        else
+        {
+            //任务已完成
+            System.out.println("task is done");
+        }
+    }
+}
+
+执行结果：
+
+callable do somothing
+future is cancel:true
+future is done:true
+task is done
+这个DEMO主要是通过调用FutureTask的状态设置的方法，演示了状态的变迁。
+
+a、第11行，尝试取消对任务的执行，该方法如果由于任务已完成、已取消则返回false，如果能够取消还未完成的任务，则返回true，该DEMO中由于任务还在休眠状态，所以可以取消成功。
+
+future.cancel(true);
+b、第13行，判断任务取消是否成功：如果在任务正常完成前将其取消，则返回true
+
+System.out.println("future is cancel:" + future.isCancelled());
+
+重点:完成的理由有三种,不是只有一种
+c、第19行，判断任务是否完成：如果任务完成，则返回true，以下几种情况都属于任务完成：正常终止、异常或者取消而完成。
+    我们的DEMO中，任务是由于取消而导致完成。
+ System.out.println("future is done:" + future.isDone());
+
+重点:异步处理  ,但是future.get方法是阻塞的,阻塞在当前线程中
+d、在第22行，获取异步线程执行的结果，我这个DEMO中没有执行到这里，需要注意的是，future.get方法会阻塞当前线程， 直到任务执行完成返回结果为止。
+System.out.println("future get=" + future.get());
+
+get方法是阻塞的证明:
+Callable与Future
+public class CallableThread implements Callable<String>
+{
+    @Override
+    public String call()
+        throws Exception
+    {
+        System.out.println("进入Call方法，开始休眠，休眠时间为：" + System.currentTimeMillis());
+        Thread.sleep(10000);
+        return "今天停电";
+    }
+    
+    public static void main(String[] args) throws Exception
+    {
+        ExecutorService es = Executors.newSingleThreadExecutor();
+//        ExecutorService es=Executors.newSingleThreadExecutor();//原来说通过Executors创建线程池不好的原因是,等待队列啥的都是默认的,不好
+        Callable<String> call = new CallableThread();
+        Future<String> fu = es.submit(call);
+        es.shutdown();
+        Thread.sleep(5000);
+        System.out.println("主线程休眠5秒，当前时间" + System.currentTimeMillis());
+        String str = fu.get();
+        System.out.println("Future已拿到数据，str=" + str + ";当前时间为：" + System.currentTimeMillis());
+    }
+}
+执行结果：
+
+进入Call方法，开始休眠，休眠时间为：1478606602676
+主线程休眠5秒，当前时间1478606608676
+Future已拿到数据，str=今天停电;当前时间为：1478606612677
+这里的future是直接扔到线程池里面去执行的。由于要打印任务的执行结果，所以从执行结果来看，主线程虽然休眠了5s，但是从Call方法执行到拿到任务的结果，这中间的时间差正好是10s，说明get方法会阻塞当前线程直到任务完成。
+
+通过FutureTask也可以达到同样的效果：
+通过FutureTask也可以达到同样的效果：
+
+
+public static void main(String[] args) throws Exception
+    {
+      ExecutorService es = Executors.newSingleThreadExecutor();
+      Callable<String> call = new CallableThread();
+      FutureTask<String> task = new FutureTask<String>(call);
+      es.submit(task);
+      es.shutdown();
+      Thread.sleep(5000);
+      System.out.println("主线程等待5秒，当前时间为：" + System.currentTimeMillis());
+      String str = task.get();
+      System.out.println("Future已拿到数据，str=" + str + ";当前时间为：" + System.currentTimeMillis());
+    }
+以上的组合可以给我们带来这样的一些变化：
+
+如有一种场景中，方法A返回一个数据需要10s,A方法后面的代码运行需要20s，但是这20s的执行过程中，只有后面10s依赖于方法A执行的结果。如果与以往一样采用同步的方式，势必会有10s的时间被浪费，如果采用前面两种组合，则效率会提高：
+
+1、先把A方法的内容放到Callable实现类的call()方法中
+
+2、在主线程中通过线程池执行A任务
+
+3、执行后面方法中10秒不依赖方法A运行结果的代码
+
+4、获取方法A的运行结果，执行后面方法中10秒依赖方法A运行结果的代码
+
+这样代码执行效率一下子就提高了，程序不必卡在A方法处。
+
+
+
+参考:
+https://www.cnblogs.com/dongguacai
+
+
+
+
+
+
+
+
+
